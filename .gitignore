@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Logs (regenerables)
+logs/
+*.log
+
+# WAL/SHM temporales de SQLite
+*.db-wal
+*.db-shm

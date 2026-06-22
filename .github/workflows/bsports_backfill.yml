@@ -1,0 +1,142 @@
+name: BSports backfill (bsportsfan.com)
+
+# Lanzar manualmente. Diseñado para correr en ciclos:
+#
+#  Liga 8-min (22614, ~55k partidos):
+#   Ciclo 1  — phase=1 league_id=22614 → raspa ~1837 páginas de lista (~60 min)
+#   Ciclo 2A — phase=2 league_id=22614 batch=15000 → rellena HT primeras 15k
+#   Ciclo 2B — phase=2 league_id=22614 batch=15000 → rellena HT siguientes
+#   Ciclo 2C — phase=2 league_id=22614 batch=15000 → completa HT restantes
+#
+#  Liga 12-min GT Leagues (23114, ~55k partidos):
+#   Ciclo 1  — phase=1 league_id=23114 → raspa ~1812 páginas de lista (~60 min)
+#   Ciclo 2A — phase=2 league_id=23114 batch=15000 → rellena HT primeras 15k
+#   Ciclo 2B — phase=2 league_id=23114 batch=15000 → rellena HT siguientes
+#   Ciclo 2C — phase=2 league_id=23114 batch=15000 → completa HT restantes
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Fase: 1 (lista FT) o 2 (detalles HT)'
+        required: true
+        default: '1'
+      league_id:
+        description: 'Liga: 22614 (8-min Batalla) o 23114 (12-min GT Leagues)'
+        required: false
+        default: '22614'
+      batch:
+        description: 'Fase 2: máx partidos de detalle por tanda'
+        required: false
+        default: '15000'
+      start_page:
+        description: 'Fase 1: forzar inicio desde esta página (vacío=auto)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Prueba: solo N páginas (vacío=producción)'
+        required: false
+        default: ''
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 5h50m — margen antes del límite de 6h de GH
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml "polars>=1.0.0"
+
+      - name: Show current DB state
+        run: |
+          cd esoccer_goals
+          if [ -f data/bsports.db ]; then
+            python bsports_scraper.py --phase 1 --stats --db data/bsports.db || true
+          else
+            echo "BD no existe aún. Se creará."
+          fi
+
+      - name: Run Phase 1 — list scraper
+        if: ${{ github.event.inputs.phase == '1' }}
+        run: |
+          cd esoccer_goals
+          ARGS="--phase 1 --db data/bsports.db --league-id ${{ github.event.inputs.league_id || '22614' }}"
+          if [ -n "${{ github.event.inputs.start_page }}" ]; then
+            ARGS="$ARGS --start-page ${{ github.event.inputs.start_page }}"
+          fi
+          if [ -n "${{ github.event.inputs.dry_run }}" ]; then
+            ARGS="$ARGS --dry-run ${{ github.event.inputs.dry_run }}"
+          fi
+          python bsports_scraper.py $ARGS
+
+      - name: Run Phase 2 — detail scraper (HT scores)
+        if: ${{ github.event.inputs.phase == '2' }}
+        run: |
+          cd esoccer_goals
+          python bsports_scraper.py \
+            --phase 2 \
+            --league-id ${{ github.event.inputs.league_id || '22614' }} \
+            --batch ${{ github.event.inputs.batch || '15000' }} \
+            --db data/bsports.db
+
+      - name: Build Polars features (si fase 1 completa)
+        if: ${{ github.event.inputs.phase == '1' }}
+        run: |
+          cd esoccer_goals
+          LID="${{ github.event.inputs.league_id || '22614' }}"
+          DONE=$(python -c "
+          import sqlite3, sys
+          try:
+            conn = sqlite3.connect('data/bsports.db')
+            done = conn.execute(\"SELECT value FROM _progress WHERE key='phase1_done_${LID}'\").fetchone()
+            print('1' if done and done[0]=='1' else '0')
+          except: print('0')
+          ")
+          if [ "$DONE" = "1" ]; then
+            echo "Fase 1 liga ${LID} completa — generando bsports_features.csv"
+            python bsports_feature_builder.py
+          else
+            echo "Fase 1 no completa aún — features se generarán en el ciclo final"
+          fi
+
+      - name: Build Polars features (tras fase 2)
+        if: ${{ github.event.inputs.phase == '2' }}
+        run: |
+          cd esoccer_goals
+          PENDING=$(python -c "
+          import sqlite3, sys
+          try:
+            conn = sqlite3.connect('data/bsports.db')
+            n = conn.execute(\"SELECT COUNT(*) FROM bsports_matches WHERE detail_done=0\").fetchone()[0]
+            print(n)
+          except: print('999')
+          ")
+          echo "Partidos pendientes de HT: $PENDING"
+          python bsports_feature_builder.py || echo "Feature builder fallido (BD vacía?)"
+
+      - name: Final DB stats
+        run: |
+          cd esoccer_goals
+          python bsports_scraper.py --phase 1 --stats --db data/bsports.db || true
+
+      - name: Commit bsports.db
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add esoccer_goals/data/bsports.db esoccer_goals/data/bsports_features.csv || true
+          LID="${{ github.event.inputs.league_id || '22614' }}"
+          git diff --cached --quiet || git commit -m \
+            "bsports: phase${{ github.event.inputs.phase }} liga${LID} $(date -u +%Y-%m-%dT%H:%M)Z"
+          git push

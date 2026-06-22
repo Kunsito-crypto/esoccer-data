@@ -1,0 +1,54 @@
+name: Esoccer data collection (every 3h)
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'  # cada 3h UTC (00, 03, 06, 09, 12, 15, 18, 21)
+  workflow_dispatch:        # permite lanzarlo manualmente desde GitHub
+    inputs:
+      max_pages:
+        description: 'Páginas por jugador (3=normal, 15=backfill histórico)'
+        required: false
+        default: '3'
+      league:
+        description: 'Liga: 8 (8 mins), 12 (12 mins) o all (ambas)'
+        required: false
+        default: 'all'
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r esoccer_goals/requirements.txt
+
+      - name: Run scraper (8 mins)
+        if: ${{ github.event.inputs.league == '8' || github.event.inputs.league == 'all' || github.event.inputs.league == '' }}
+        run: |
+          cd esoccer_goals
+          python main.py --league 8 --max-pages ${{ github.event.inputs.max_pages || '3' }}
+
+      - name: Run scraper (12 mins)
+        if: ${{ github.event.inputs.league == '12' || github.event.inputs.league == 'all' || github.event.inputs.league == '' }}
+        run: |
+          cd esoccer_goals
+          python main.py --league 12 --max-pages ${{ github.event.inputs.max_pages || '3' }}
+
+      - name: Commit updated DBs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add esoccer_goals/data/esoccer.db esoccer_goals/data/esoccer_12min.db
+          git diff --cached --quiet || git commit -m "auto: scraper data $(date -u +%Y-%m-%d)"
+          git push
